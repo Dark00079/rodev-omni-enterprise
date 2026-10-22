@@ -3,3 +3,4 @@ workspace_vfs/
 test/artifacts/
 *.log
 .cache/
+coverage/

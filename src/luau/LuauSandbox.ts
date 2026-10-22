@@ -114,7 +114,7 @@ export class LuauSandbox {
           }
         });
         return () => conn.Disconnect();
-      }, timeout);
+      }, timeout, (t) => { t.pushNil(); return 1; });
     });
   }
 }

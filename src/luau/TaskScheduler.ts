@@ -95,6 +95,7 @@ export class TaskScheduler {
     thread: LuauVM,
     setup: (resolve: (push?: (vm: LuauVM) => number) => void) => (() => void) | void,
     timeoutSec?: number,
+    onTimeout?: (vm: LuauVM) => number,
   ): never {
     let settled = false;
     let cleanup: (() => void) | void;
@@ -111,7 +112,7 @@ export class TaskScheduler {
     };
     cleanup = setup(resolve);
     if (timeoutSec !== undefined && timeoutSec > 0 && Number.isFinite(timeoutSec)) {
-      cancelTimer = this.addTimer(timeoutSec, () => resolve());
+      cancelTimer = this.addTimer(timeoutSec, () => resolve(onTimeout));
     }
     thread.prepareYield(0);
   }
