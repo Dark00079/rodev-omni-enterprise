@@ -196,4 +196,46 @@ extern "C"
     {
         interruptCounter = 0;
     }
+
+    // Exposes VM constants so the TS binding never hardcodes fork-specific enum
+    // values. Keep the id list in sync with LuauConst in src/luau/LuauVM.ts.
+    EMSCRIPTEN_KEEPALIVE int rd_const(int id)
+    {
+        switch (id)
+        {
+        case 0: return LUA_MULTRET;
+        case 1: return LUA_REGISTRYINDEX;
+        case 2: return LUA_ENVIRONINDEX;
+        case 3: return LUA_GLOBALSINDEX;
+        case 10: return LUA_TNIL;
+        case 11: return LUA_TBOOLEAN;
+        case 12: return LUA_TLIGHTUSERDATA;
+        case 13: return LUA_TNUMBER;
+        case 14: return LUA_TVECTOR;
+        case 15: return LUA_TSTRING;
+        case 16: return LUA_TTABLE;
+        case 17: return LUA_TFUNCTION;
+        case 18: return LUA_TUSERDATA;
+        case 19: return LUA_TTHREAD;
+        case 20: return LUA_TBUFFER;
+        case 30: return LUA_OK;
+        case 31: return LUA_YIELD;
+        case 32: return LUA_ERRRUN;
+        case 33: return LUA_ERRSYNTAX;
+        case 34: return LUA_ERRMEM;
+        case 35: return LUA_ERRERR;
+        case 36: return LUA_BREAK;
+        case 40: return LUA_CORUN;
+        case 41: return LUA_COSUS;
+        case 42: return LUA_CONOR;
+        case 43: return LUA_COFIN;
+        case 44: return LUA_COERR;
+        default: return 0x7fffffff;
+        }
+    }
+
+    EMSCRIPTEN_KEEPALIVE int rd_upvalueindex(int i)
+    {
+        return lua_upvalueindex(i);
+    }
 }
