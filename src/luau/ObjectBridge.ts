@@ -41,6 +41,9 @@ const TUPLE_METHODS = new Set([
   'ScreenPointToRay', 'ToHSV', 'ToEulerAnglesXYZ', 'ToOrientation', 'GetComponents', 'components',
 ]);
 
+/** A possibly-suspending method: pushes results and returns the count, or yields. */
+export type YieldingMethod = (vm: LuauVM, self: any, args: any[]) => number;
+
 function isEnumItem(o: any): boolean {
   return o && typeof o === 'object' && typeof o.EnumType === 'string' && typeof o.Value === 'number' && typeof o.Name === 'string';
 }
@@ -66,9 +69,22 @@ export class ObjectBridge {
   // Stack operations target whichever thread is currently executing. Host
   // callbacks set this to their thread; JS->Lua callbacks fall back to main.
   private active: LuauVM;
+  // Methods that may suspend the calling thread (e.g. WaitForChild). The
+  // handler either pushes results and returns the count, or yields.
+  private readonly yieldingMethods = new Map<string, YieldingMethod>();
 
   constructor(private readonly vm: LuauVM) {
     this.active = vm;
+  }
+
+  /** Registers a method name whose handler may suspend the calling thread. */
+  registerYielding(name: string, handler: YieldingMethod): void {
+    this.yieldingMethods.set(name, handler);
+  }
+
+  /** Marshals a JS value onto `vm`'s stack (sets it active for the push). */
+  marshalInto(vm: LuauVM, value: any): void {
+    this.runOn(vm, () => this.marshalToLua(value));
   }
 
   /** Runs `fn` with `vm` as the active stack target, restoring afterwards. */
@@ -215,6 +231,15 @@ export class ObjectBridge {
   private invokeMethod(vm: LuauVM, methodName: string): number {
     const self = vm.toRef(1, REF_TAG);
     if (self === undefined) throw new Error(`cannot invoke ${methodName} on a non-object`);
+
+    const yielding = this.yieldingMethods.get(methodName);
+    if (yielding) {
+      const top = vm.getTop();
+      const args: any[] = [];
+      for (let i = 2; i <= top; i++) args.push(this.marshalToJS(i));
+      return yielding(vm, self, args); // may push+return, or throw to yield
+    }
+
     const fn = self[methodName];
     if (typeof fn !== 'function') {
       throw new Error(`${methodName} is not a valid member of ${robloxTypeOf(self)}`);

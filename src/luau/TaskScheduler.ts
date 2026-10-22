@@ -18,10 +18,13 @@ interface WaitingThread {
   isMain: boolean;
 }
 
+interface Timer { at: number; fn: () => void; cancelled: boolean; }
+
 export class TaskScheduler {
   public clock = 0;
   private waiting: WaitingThread[] = [];
   private deferred: Array<() => void> = [];
+  private timers: Timer[] = [];
   private liveThreads = new Set<LuauVM>();
   public lastError: string | null = null;
 
@@ -75,6 +78,44 @@ export class TaskScheduler {
     return thread;
   }
 
+  /** Schedules `fn` to run after `delay` simulated seconds; returns a canceller. */
+  addTimer(delay: number, fn: () => void): () => void {
+    const timer: Timer = { at: this.clock + Math.max(0, delay || 0), fn, cancelled: false };
+    this.timers.push(timer);
+    return () => { timer.cancelled = true; };
+  }
+
+  /**
+   * Parks `thread` until an external event resolves it. `setup(resolve)` wires
+   * up the event source and returns an optional cleanup; calling `resolve(push)`
+   * resumes the thread (push, run on the thread, returns the number of results).
+   * An optional timeout resolves with no results when it elapses first.
+   */
+  yieldCondition(
+    thread: LuauVM,
+    setup: (resolve: (push?: (vm: LuauVM) => number) => void) => (() => void) | void,
+    timeoutSec?: number,
+  ): never {
+    let settled = false;
+    let cleanup: (() => void) | void;
+    let cancelTimer: (() => void) | undefined;
+    const resolve = (push?: (vm: LuauVM) => number) => {
+      if (settled) return;
+      settled = true;
+      if (cleanup) cleanup();
+      if (cancelTimer) cancelTimer();
+      this.deferred.push(() => {
+        const n = push ? push(thread) : 0;
+        this.resumeThread(thread, n, null);
+      });
+    };
+    cleanup = setup(resolve);
+    if (timeoutSec !== undefined && timeoutSec > 0 && Number.isFinite(timeoutSec)) {
+      cancelTimer = this.addTimer(timeoutSec, () => resolve());
+    }
+    thread.prepareYield(0);
+  }
+
   /** Runs `source` as the main script on its own thread; drains the scheduler. */
   runMain(source: string, chunkName: string, budgetMs = 5000): string | null {
     this.main.setExecutionBudget(budgetMs);
@@ -101,18 +142,26 @@ export class TaskScheduler {
   drain(budgetMs: number): void {
     const deadline = Date.now() + budgetMs;
     let guard = 0;
-    while ((this.waiting.length > 0 || this.deferred.length > 0) && Date.now() < deadline) {
+    while (this.pendingCount > 0 && Date.now() < deadline) {
       this.runDeferred();
-      if (this.waiting.length === 0) break;
+      const deadlines = [
+        ...this.waiting.map((w) => w.resumeAt),
+        ...this.timers.filter((t) => !t.cancelled).map((t) => t.at),
+      ];
+      if (deadlines.length === 0) break;
       // Advance virtual time to the next pending deadline.
-      const next = Math.min(...this.waiting.map((w) => w.resumeAt));
-      this.clock = Math.max(this.clock, next);
+      this.clock = Math.max(this.clock, Math.min(...deadlines));
       this.runDue();
       if (++guard > 1_000_000) break;
     }
   }
 
   private runDue(): void {
+    // Fire due timers first (WaitForChild timeouts, task.delay fallbacks).
+    const dueTimers = this.timers.filter((t) => !t.cancelled && t.at <= this.clock + 1e-9);
+    this.timers = this.timers.filter((t) => !t.cancelled && t.at > this.clock + 1e-9);
+    for (const t of dueTimers) t.fn();
+
     const due = this.waiting.filter((w) => w.resumeAt <= this.clock + 1e-9);
     this.waiting = this.waiting.filter((w) => w.resumeAt > this.clock + 1e-9);
     for (const w of due) {
@@ -161,10 +210,13 @@ export class TaskScheduler {
     this.clock = 0;
     this.waiting = [];
     this.deferred = [];
+    this.timers = [];
     this.lastError = null;
     for (const t of this.liveThreads) this.main.releaseThread(t);
     this.liveThreads.clear();
   }
 
-  get pendingCount(): number { return this.waiting.length + this.deferred.length; }
+  get pendingCount(): number {
+    return this.waiting.length + this.deferred.length + this.timers.filter((t) => !t.cancelled).length;
+  }
 }
