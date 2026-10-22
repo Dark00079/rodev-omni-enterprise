@@ -11,6 +11,7 @@
 
 import { LuauVM, LuaType } from './LuauVM.js';
 import { ObjectBridge, robloxTypeOf } from './ObjectBridge.js';
+import { TaskScheduler } from './TaskScheduler.js';
 import {
   Vector2, Vector3, CFrame, UDim, UDim2, Color3, ColorSequence, ColorSequenceKeypoint,
   NumberSequence, NumberSequenceKeypoint, Ray, RaycastParams, OverlapParams, TweenInfo, Rect, Enum,
@@ -25,12 +26,16 @@ export interface RobloxEnvironment {
   bridge: ObjectBridge;
   game: DataModel;
   logs: EnvLog[];
+  scheduler: TaskScheduler;
 }
 
 export function installEnvironment(vm: LuauVM, game: DataModel): RobloxEnvironment {
   const bridge = new ObjectBridge(vm);
   const logs: EnvLog[] = [];
-  const env: RobloxEnvironment = { vm, bridge, game, logs };
+  const scheduler = new TaskScheduler(vm, bridge, (msg) =>
+    logs.push({ level: 'error', text: msg }),
+  );
+  const env: RobloxEnvironment = { vm, bridge, game, logs, scheduler };
 
   // --- a library table of plain (no-self) functions/values --------------
   const lib = (name: string, members: Record<string, any>) => {
@@ -111,32 +116,47 @@ export function installEnvironment(vm: LuauVM, game: DataModel): RobloxEnvironme
   }, 'typeof');
   vm.setGlobal('typeof');
 
-  const startClock = Date.now();
-  installPlainFunction(vm, bridge, () => (Date.now() - startClock) / 1000, 'tick');
+  installPlainFunction(vm, bridge, () => scheduler.clock, 'tick');
   vm.setGlobal('tick');
-  installPlainFunction(vm, bridge, () => (Date.now() - startClock) / 1000, 'time');
+  installPlainFunction(vm, bridge, () => scheduler.clock, 'time');
   vm.setGlobal('time');
+  installPlainFunction(vm, bridge, () => scheduler.clock, 'elapsedTime');
+  vm.setGlobal('elapsedTime');
+
+  // --- task library (coroutine scheduler) --------------------------------
+  vm.newTable();
+  vm.pushJSFunction((v) => scheduler.wait(v, v.getTop() >= 1 ? v.toNumber(1) : 0), 'wait');
+  vm.setField(-2, 'wait');
+  vm.pushJSFunction((v) => { const t = scheduler.spawnFromStack(v); v.pushThread(t); return 1; }, 'spawn');
+  vm.setField(-2, 'spawn');
+  vm.pushJSFunction((v) => { const t = scheduler.deferFromStack(v); v.pushThread(t); return 1; }, 'defer');
+  vm.setField(-2, 'defer');
+  vm.pushJSFunction((v) => { const d = v.toNumber(1); const t = scheduler.delayFromStack(v, d); v.pushThread(t); return 1; }, 'delay');
+  vm.setField(-2, 'delay');
+  vm.pushJSFunction(() => 0, 'cancel'); // cancellation is a no-op placeholder
+  vm.setField(-2, 'cancel');
+  vm.setGlobal('task');
+
+  // Legacy globals that map onto the scheduler.
+  vm.pushJSFunction((v) => scheduler.wait(v, v.getTop() >= 1 ? v.toNumber(1) : 0), 'wait');
+  vm.setGlobal('wait');
+  vm.pushJSFunction((v) => { scheduler.spawnFromStack(v); return 0; }, 'spawn');
+  vm.setGlobal('spawn');
+  vm.pushJSFunction((v) => { const d = v.toNumber(1); scheduler.delayFromStack(v, d); return 0; }, 'delay');
+  vm.setGlobal('delay');
 
   return env;
 }
 
 // Installs a function that takes positional args (no implicit self) and
-// marshals a single/tuple result back.
+// marshals a single result back, pushed onto the stack.
 function installPlainFunction(
-  vm: LuauVM,
+  _vm: LuauVM,
   bridge: ObjectBridge,
   fn: (...args: any[]) => any,
   name: string,
 ): void {
-  vm.pushJSFunction((v) => {
-    const n = v.getTop();
-    const args: any[] = [];
-    for (let i = 1; i <= n; i++) args.push(bridge.marshalToJS(i));
-    const result = fn(...args);
-    if (result === undefined) return 0;
-    bridge.marshalToLua(result);
-    return 1;
-  }, name);
+  bridge.pushFunction(fn, name);
 }
 
 function luaTypeName(vm: LuauVM, idx: number): string {

@@ -63,12 +63,24 @@ export class ObjectBridge {
   private readonly metatables = new Map<string, number>(); // type name -> registry ref
   // Shared metamethod closures, reffed once and reused across all metatables.
   private sharedRefs: Record<string, number> | null = null;
+  // Stack operations target whichever thread is currently executing. Host
+  // callbacks set this to their thread; JS->Lua callbacks fall back to main.
+  private active: LuauVM;
 
-  constructor(private readonly vm: LuauVM) {}
+  constructor(private readonly vm: LuauVM) {
+    this.active = vm;
+  }
+
+  /** Runs `fn` with `vm` as the active stack target, restoring afterwards. */
+  private runOn<T>(vm: LuauVM, fn: () => T): T {
+    const prev = this.active;
+    this.active = vm;
+    try { return fn(); } finally { this.active = prev; }
+  }
 
   /** Pushes a JS object as bridged userdata with the metatable for its type. */
   pushObject(obj: any): void {
-    const vm = this.vm;
+    const vm = this.active;
     vm.pushRef(obj, REF_TAG);
     const mtRef = this.metatableFor(robloxTypeOf(obj));
     vm.getRef(mtRef);     // metatable on top, userdata below
@@ -77,7 +89,7 @@ export class ObjectBridge {
 
   /** Marshals a JS value onto the Lua stack. */
   marshalToLua(value: any): void {
-    const vm = this.vm;
+    const vm = this.active;
     if (value === null || value === undefined) { vm.pushNil(); return; }
     switch (typeof value) {
       case 'number': vm.pushNumber(value); return;
@@ -101,7 +113,7 @@ export class ObjectBridge {
 
   /** Reads a Lua value at `idx` into a JS value. */
   marshalToJS(idx: number): any {
-    const vm = this.vm;
+    const vm = this.active;
     switch (vm.type(idx)) {
       case LuaType.Nil: return null;
       case LuaType.Boolean: return vm.toBoolean(idx);
@@ -119,7 +131,7 @@ export class ObjectBridge {
   }
 
   private tableToJS(idx: number): any {
-    const vm = this.vm;
+    const vm = this.active;
     const abs = idx < 0 ? vm.getTop() + idx + 1 : idx;
     const arr: any[] = [];
     const obj: Record<string, any> = {};
@@ -146,38 +158,49 @@ export class ObjectBridge {
 
   /** Wraps a Lua function (at idx) as a JS callback. Holds a registry ref. */
   private wrapLuaFunction(idx: number): (...args: any[]) => any {
-    const vm = this.vm;
-    vm.pushValue(idx);
-    const ref = vm.ref(-1);
-    vm.pop(1);
+    const src = this.active;
+    src.pushValue(idx);
+    const ref = src.ref(-1);
+    src.pop(1);
     const bridge = this;
-    return (...args: any[]) => {
-      vm.getRef(ref);
+    const main = this.vm;
+    // Invoked later from JS (e.g. a signal handler), when no thread is running,
+    // so the call is driven on the main state.
+    return (...args: any[]) => bridge.runOn(main, () => {
+      main.getRef(ref);
       for (const a of args) bridge.marshalToLua(a);
-      const err = vm.pcall(args.length, 1);
-      if (err) { vm.clearExecutionBudget(); throw new Error(err); }
+      const err = main.pcall(args.length, 1);
+      if (err) { main.clearExecutionBudget(); throw new Error(err); }
       const result = bridge.marshalToJS(-1);
-      vm.pop(1);
+      main.pop(1);
       return result;
-    };
+    });
+  }
+
+  /**
+   * Pushes a JS function exposed to Lua as a plain positional-argument function
+   * (no implicit self): arguments are marshalled to JS, the result back to Lua.
+   */
+  pushFunction(fn: (...args: any[]) => any, name?: string): void {
+    this.pushJSWrapped(fn, name);
   }
 
   // A JS function exposed to Lua (e.g. a constructor or library function).
-  private pushJSWrapped(fn: (...args: any[]) => any): void {
-    const vm = this.vm;
+  private pushJSWrapped(fn: (...args: any[]) => any, nameOverride?: string): void {
+    const vm = this.active;
     const bridge = this;
-    vm.pushJSFunction((v) => {
+    vm.pushJSFunction((v) => bridge.runOn(v, () => {
       const n = v.getTop();
       const args: any[] = [];
       for (let i = 1; i <= n; i++) args.push(bridge.marshalToJS(i));
       const result = fn(...args);
       return bridge.pushResult(result, false);
-    }, fn.name || 'fn');
+    }), nameOverride || fn.name || 'fn');
   }
 
   // Pushes a method/function result; returns the number of Lua return values.
   private pushResult(result: any, tuple: boolean): number {
-    const vm = this.vm;
+    const vm = this.active;
     if (result === undefined) return 0;
     if (tuple && Array.isArray(result)) {
       for (const item of result) this.marshalToLua(item);
@@ -283,7 +306,7 @@ export class ObjectBridge {
 
   private ensureSharedRefs(): Record<string, number> {
     if (this.sharedRefs) return this.sharedRefs;
-    const vm = this.vm;
+    const vm = this.active;
     const bridge = this;
     const make = (fn: (v: LuauVM) => number, name: string): number => {
       vm.pushJSFunction(fn, name);
@@ -291,16 +314,18 @@ export class ObjectBridge {
       vm.pop(1);
       return ref;
     };
+    // Each metamethod runs with the invoking thread as the active stack.
+    const on = (fn: (v: LuauVM) => number) => (v: LuauVM) => bridge.runOn(v, () => fn(v));
     this.sharedRefs = {
-      __index: make((v) => bridge.indexMember(v), '__index'),
-      __newindex: make((v) => bridge.newindexMember(v), '__newindex'),
-      __namecall: make((v) => bridge.invokeMethod(v, v.namecallName()), '__namecall'),
-      __tostring: make((v) => bridge.tostringMetamethod(v), '__tostring'),
-      __add: make((v) => bridge.arithMetamethod(v, 'add', true), '__add'),
-      __sub: make((v) => bridge.arithMetamethod(v, 'sub', false), '__sub'),
-      __mul: make((v) => bridge.arithMetamethod(v, 'mul', true), '__mul'),
-      __div: make((v) => bridge.arithMetamethod(v, 'div', false), '__div'),
-      __eq: make((v) => bridge.eqMetamethod(v), '__eq'),
+      __index: make(on((v) => bridge.indexMember(v)), '__index'),
+      __newindex: make(on((v) => bridge.newindexMember(v)), '__newindex'),
+      __namecall: make(on((v) => bridge.invokeMethod(v, v.namecallName())), '__namecall'),
+      __tostring: make(on((v) => bridge.tostringMetamethod(v)), '__tostring'),
+      __add: make(on((v) => bridge.arithMetamethod(v, 'add', true)), '__add'),
+      __sub: make(on((v) => bridge.arithMetamethod(v, 'sub', false)), '__sub'),
+      __mul: make(on((v) => bridge.arithMetamethod(v, 'mul', true)), '__mul'),
+      __div: make(on((v) => bridge.arithMetamethod(v, 'div', false)), '__div'),
+      __eq: make(on((v) => bridge.eqMetamethod(v)), '__eq'),
     };
     return this.sharedRefs;
   }
@@ -309,7 +334,7 @@ export class ObjectBridge {
     const existing = this.metatables.get(typeName);
     if (existing !== undefined) return existing;
 
-    const vm = this.vm;
+    const vm = this.active;
     const shared = this.ensureSharedRefs();
     vm.newTable();
     vm.pushString(typeName);

@@ -181,6 +181,12 @@ export class LuauVM {
     (this as any).refs = main.refs;
     (this as any).refHandles = main.refHandles;
     (this as any).threadRegistry = main.threadRegistry;
+    // Cached VM constants are per global-state, so all threads share them.
+    this.typeCodes = main.typeCodes;
+    this.gidx = main.gidx;
+    this.ridx = main.ridx;
+    this.okCode = main.okCode;
+    this.scratch = main.scratch;
     Object.defineProperty(this, 'nextRefHandle', {
       get: () => main.nextRefHandle,
       set: (v) => { main.nextRefHandle = v; },
@@ -318,6 +324,60 @@ export class LuauVM {
   }
 
   concat(n: number): void { this.M._lua_concat(this.L, n); }
+
+  // ---- threads / coroutines ---------------------------------------------
+
+  /** Registry ref that keeps this thread alive; set for thread VMs. */
+  public threadRef = 0;
+
+  /** Creates a new coroutine thread (kept alive via a registry ref). */
+  newThread(): LuauVM {
+    const threadL = this.M._lua_newthread(this.L);
+    const ref = this.ref(-1);
+    this.pop(1);
+    const child = this.vmForState(threadL);
+    child.threadRef = ref;
+    return child;
+  }
+
+  /** Resumes this thread. Returns the raw lua_Status code. */
+  resume(from: LuauVM | null, nargs: number): number {
+    return this.M._lua_resume(this.L, from ? from.L : 0, nargs);
+  }
+
+  /** Coroutine status of this thread as observed from `from`. */
+  coStatus(from: LuauVM): CoStatus {
+    const s = this.M._lua_costatus(from.L, this.L);
+    const k = (id: number) => this.M._rd_const(id);
+    if (s === k(40)) return CoStatus.Running;
+    if (s === k(41)) return CoStatus.Suspended;
+    if (s === k(42)) return CoStatus.Normal;
+    if (s === k(43)) return CoStatus.Finished;
+    return CoStatus.Error;
+  }
+
+  /** Moves the top `n` values from this stack onto `target`'s stack. */
+  xmoveTo(target: LuauVM, n: number): void {
+    this.M._lua_xmove(this.L, target.L, n);
+  }
+
+  /** Pushes a thread VM's thread value onto this stack. */
+  pushThread(thread: LuauVM): void {
+    if (thread.threadRef) this.getRef(thread.threadRef);
+    else this.pushNil();
+  }
+
+  isStatusOk(code: number): boolean { return code === this.okCode; }
+  isStatusYield(code: number): boolean { return code === this.M._rd_const(C.YIELD); }
+
+  /** Releases a thread VM's keep-alive ref so it can be collected. */
+  releaseThread(thread: LuauVM): void {
+    if (thread.threadRef) {
+      this.unref(thread.threadRef);
+      thread.threadRef = 0;
+      this.threadRegistry.delete(thread.L);
+    }
+  }
 
   // ---- yielding & interrupts --------------------------------------------
 
