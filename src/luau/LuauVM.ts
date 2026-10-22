@@ -79,6 +79,14 @@ export class LuauVM {
   private interruptDeadline = Infinity;
   private threadRegistry = new Map<number, LuauVM>();
 
+  // Cached VM constants and a reusable 8-byte scratch buffer (avoids malloc on
+  // hot paths like toString/namecallName).
+  private typeCodes!: Record<number, LuaType>;
+  private gidx!: number;
+  private ridx!: number;
+  private okCode!: number;
+  private scratch!: number;
+
   private constructor(M: LuauWasmModule, L: number, isMain: boolean) {
     this.M = M;
     this.L = L;
@@ -90,9 +98,31 @@ export class LuauVM {
     const M = await loadLuauModule();
     const L = M._rd_newstate();
     const vm = new LuauVM(M, L, true);
+    vm.cacheConstants();
     vm.installHostBridge();
     M._rd_registerrefdtor(L, REF_TAG);
     return vm;
+  }
+
+  private cacheConstants(): void {
+    const k = (id: number) => this.M._rd_const(id);
+    this.gidx = k(C.GLOBALSINDEX);
+    this.ridx = k(C.REGISTRYINDEX);
+    this.okCode = k(C.OK);
+    this.scratch = this.M._malloc(8);
+    this.typeCodes = {
+      [k(C.TNIL)]: LuaType.Nil,
+      [k(C.TBOOLEAN)]: LuaType.Boolean,
+      [k(C.TLIGHTUSERDATA)]: LuaType.LightUserdata,
+      [k(C.TNUMBER)]: LuaType.Number,
+      [k(C.TVECTOR)]: LuaType.Vector,
+      [k(C.TSTRING)]: LuaType.String,
+      [k(C.TTABLE)]: LuaType.Table,
+      [k(C.TFUNCTION)]: LuaType.Function,
+      [k(C.TUSERDATA)]: LuaType.Userdata,
+      [k(C.TTHREAD)]: LuaType.Thread,
+      [k(C.TBUFFER)]: LuaType.Buffer,
+    };
   }
 
   private installHostBridge(): void {
@@ -265,24 +295,29 @@ export class LuauVM {
   getGlobal(key: string): LuaType { return this.getField(this.globalsIndex, key); }
   setGlobal(key: string): void { this.setField(this.globalsIndex, key); }
 
-  get globalsIndex(): number { return this.M._rd_const(C.GLOBALSINDEX); }
-  get registryIndex(): number { return this.M._rd_const(C.REGISTRYINDEX); }
+  get globalsIndex(): number { return this.gidx; }
+  get registryIndex(): number { return this.ridx; }
   get multret(): number { return this.M._rd_const(C.MULTRET); }
 
   private mapType(t: number): LuaType {
-    if (t === this.M._rd_const(C.TNIL)) return LuaType.Nil;
-    if (t === this.M._rd_const(C.TBOOLEAN)) return LuaType.Boolean;
-    if (t === this.M._rd_const(C.TLIGHTUSERDATA)) return LuaType.LightUserdata;
-    if (t === this.M._rd_const(C.TNUMBER)) return LuaType.Number;
-    if (t === this.M._rd_const(C.TVECTOR)) return LuaType.Vector;
-    if (t === this.M._rd_const(C.TSTRING)) return LuaType.String;
-    if (t === this.M._rd_const(C.TTABLE)) return LuaType.Table;
-    if (t === this.M._rd_const(C.TFUNCTION)) return LuaType.Function;
-    if (t === this.M._rd_const(C.TUSERDATA)) return LuaType.Userdata;
-    if (t === this.M._rd_const(C.TTHREAD)) return LuaType.Thread;
-    if (t === this.M._rd_const(C.TBUFFER)) return LuaType.Buffer;
-    return LuaType.Nil;
+    return this.typeCodes[t] ?? LuaType.Nil;
   }
+
+  // ---- references & namecall --------------------------------------------
+
+  /** Creates a registry reference to the value at idx (does not pop). */
+  ref(idx: number): number { return this.M._lua_ref(this.L, idx); }
+  unref(r: number): void { this.M._lua_unref(this.L, r); }
+  /** Pushes the referenced value; returns its type. */
+  getRef(r: number): LuaType { return this.rawGetI(this.registryIndex, r); }
+
+  /** Method name during a __namecall metamethod, or '' outside one. */
+  namecallName(): string {
+    const ptr = this.M._lua_namecallatom(this.L, this.scratch);
+    return ptr === 0 ? '' : this.M.UTF8ToString(ptr);
+  }
+
+  concat(n: number): void { this.M._lua_concat(this.L, n); }
 
   // ---- yielding & interrupts --------------------------------------------
 
